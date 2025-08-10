@@ -1,0 +1,111 @@
+name: ArgoCD Template Deployment
+
+on:
+  workflow_call:
+    inputs:
+      service_name:
+        description: "Service name (e.g., auth-service)"
+        required: true
+        type: string
+      environment:
+        description: "Environment (e.g., dev, sit, stg, uat)"
+        required: true
+        type: string
+      repo_url:
+        description: "Git repo for ArgoCD Application source"
+        required: true
+        type: string
+      target_revision:
+        description: "Git branch, tag, or commit SHA"
+        required: true
+        type: string
+    secrets:
+      KUBE_CONFIG:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.30.0'
+
+      - name: Configure Kubeconfig
+        run: |
+          echo "${KUBE_CONFIG}" | base64 -d > $HOME/.kube/config
+        env:
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+
+      - name: Prepare Variables
+        id: vars
+        run: |
+          SERVICE="${{ inputs.service_name }}"
+          ENV="${{ inputs.environment }}"
+          APP_NAME="${SERVICE}-${ENV}"
+          REPO_URL="${{ inputs.repo_url }}"
+          TARGET_REV="${{ inputs.target_revision }}"
+
+          echo "service=$SERVICE" >> $GITHUB_OUTPUT
+          echo "env=$ENV" >> $GITHUB_OUTPUT
+          echo "app_name=$APP_NAME" >> $GITHUB_OUTPUT
+          echo "repo_url=$REPO_URL" >> $GITHUB_OUTPUT
+          echo "target_rev=$TARGET_REV" >> $GITHUB_OUTPUT
+
+      - name: Ensure ArgoCD Project Exists
+        run: |
+          APP_NAME=${{ steps.vars.outputs.app_name }}
+
+          if kubectl get appproject $APP_NAME -n argocd >/dev/null 2>&1; then
+            echo "Project $APP_NAME already exists. Skipping creation."
+          else
+            echo "Creating Project $APP_NAME..."
+            cat <<EOF | kubectl apply -f -
+            apiVersion: argoproj.io/v1alpha1
+            kind: AppProject
+            metadata:
+              name: ${APP_NAME}
+              namespace: argocd
+            spec:
+              description: Project for ${APP_NAME}
+              sourceRepos:
+                - '*'
+              destinations:
+                - namespace: '*'
+                  server: '*'
+              clusterResourceWhitelist:
+                - group: '*'
+                  kind: '*'
+            EOF
+          fi
+
+      - name: Create/Update ArgoCD Application
+        run: |
+          SERVICE=${{ steps.vars.outputs.service }}
+          ENV=${{ steps.vars.outputs.env }}
+          APP_NAME=${{ steps.vars.outputs.app_name }}
+          REPO_URL=${{ steps.vars.outputs.repo_url }}
+          TARGET_REV=${{ steps.vars.outputs.target_rev }}
+
+          cat <<EOF | kubectl apply -f -
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: ${APP_NAME}
+            namespace: argocd
+          spec:
+            project: ${APP_NAME}
+            destination:
+              namespace: env-${ENV}
+              server: https://kubernetes.default.svc
+            source:
+              repoURL: ${REPO_URL}
+              path: ${SERVICE}/${ENV}
+              targetRevision: ${TARGET_REV}
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+          EOF
